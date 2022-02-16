@@ -4,7 +4,6 @@
 
 #![warn(clippy::all)]
 
-use std::collections::VecDeque;
 use hmac::{Hmac, Mac, NewMac};
 use sha2::Sha256;
 use threadpool::ThreadPool;
@@ -31,46 +30,49 @@ struct JwtSolver {
 }
 
 impl JwtSolver {
-    // Iteratively check every possible secret string using a queue (bfs), returning the correct secret if it exists.
+    // Iteratively check every possible secret string using iterative deepening DFS, returning the correct secret if it exists.
     // This function was changed from recursive logic to iterative because I was running into issues with sharing the thread-pool itself into recursive threads.
+    // Iterative deepening DFS is also much more performant compared to recursion (regular DFS) if the max_len is overestimated.
     fn check_all(&self, secret: Vec<u8>) -> Vec<u8> {
         let thread_pool = ThreadPool::new(num_cpus::get());
         let (send, receive) = crossbeam_channel::bounded(1);
 
-        let mut queue: VecDeque<Vec<u8>> = VecDeque::new();
-        queue.push_back(secret);
-        while !queue.is_empty() {
-            let curr_secret = queue.pop_front().unwrap();
-            // println!("{}", std::str::from_utf8(&curr_secret).expect("answer not a valid string"));
+        for depth in 1..self.max_len {
+            let mut stack: Vec<Vec<u8>> = vec![];
+            stack.push(secret.clone());
+            while !stack.is_empty() {
+                let curr_secret = stack.pop().unwrap();
+                // println!("{}", std::str::from_utf8(&curr_secret).expect("answer not a valid string"));
 
-            let send_end = send.clone();
-            let msg = self.msg.clone();
-            let sig64 = self.sig64.clone();
-            let curr_secret_clone = curr_secret.clone();
+                let send_end = send.clone();
+                let msg = self.msg.clone();
+                let sig64 = self.sig64.clone();
+                let curr_secret_clone = curr_secret.clone();
 
-            thread_pool.execute(move || {
-                if is_secret_valid(&msg, &sig64, &curr_secret_clone) {
-                    send_end.send(curr_secret_clone).unwrap();  // found it!
-                }
-            });
+                thread_pool.execute(move || {
+                    if is_secret_valid(&msg, &sig64, &curr_secret_clone) {
+                        send_end.send(curr_secret_clone).unwrap();  // found it!
+                    }
+                });
 
-            if curr_secret.len() < self.max_len {
-                for &c in self.alphabet.iter() {
-                    // allocate space for a secret one character longer
-                    let mut new_secret = Vec::with_capacity(curr_secret.len() + 1);
-                    // build the new secret
-                    new_secret.extend(curr_secret.iter().chain(&mut [c].iter()));
-                    // check this secret, and recursively check longer ones
-                    queue.push_back(new_secret);
+                if curr_secret.len() <= depth {
+                    for &c in self.alphabet.iter() {
+                        // allocate space for a secret one character longer
+                        let mut new_secret = Vec::with_capacity(curr_secret.len() + 1);
+                        // build the new secret
+                        new_secret.extend(curr_secret.iter().chain(&mut [c].iter()));
+                        // check this secret, and recursively check longer ones
+                        stack.push(new_secret);
+                    }
                 }
-            }
-            // try_recv() once per iteration to see if we have already found the secret
-            match receive.try_recv() {
-                Ok(answer) => {
-                    thread_pool.join();
-                    return answer
+                // try_recv() once per iteration to see if we have already found the secret
+                match receive.try_recv() {
+                    Ok(answer) => {
+                        thread_pool.join();
+                        return answer
+                    }
+                    Err(_) => {}
                 }
-                Err(_) => {}
             }
         }
 
