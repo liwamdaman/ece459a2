@@ -3,8 +3,12 @@
 // YOU SHOULD MODIFY THIS FILE TO USE THEADING AND MESSAGE-PASSING
 
 #![warn(clippy::all)]
+
+use std::collections::VecDeque;
 use hmac::{Hmac, Mac, NewMac};
 use sha2::Sha256;
+use threadpool::ThreadPool;
+use crossbeam::crossbeam_channel;
 use std::env;
 
 const DEFAULT_ALPHABETS: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
@@ -27,28 +31,54 @@ struct JwtSolver {
 }
 
 impl JwtSolver {
-    // Recursively check every possible secret string,
-    // returning the correct secret if it exists
-    fn check_all(&self, secret: Vec<u8>) -> Option<Vec<u8>> {
-        if is_secret_valid(&self.msg, &self.sig64, &secret) {
-            return Some(secret);  // found it!
-        }
+    // Iteratively check every possible secret string using a queue (bfs), returning the correct secret if it exists.
+    // This function was changed from recursive logic to iterative because I was running into issues with sharing the thread-pool itself into recursive threads.
+    fn check_all(&self, secret: Vec<u8>) -> Vec<u8> {
+        let thread_pool = ThreadPool::new(num_cpus::get());
+        let (send, receive) = crossbeam_channel::bounded(1);
 
-        if secret.len() == self.max_len {
-            return None;  // no secret of length <= max_len
-        }
+        let mut queue: VecDeque<Vec<u8>> = VecDeque::new();
+        queue.push_back(secret);
+        while !queue.is_empty() {
+            let curr_secret = queue.pop_front().unwrap();
+            // println!("{}", std::str::from_utf8(&curr_secret).expect("answer not a valid string"));
 
-        for &c in self.alphabet.iter() {
-            // allocate space for a secret one character longer  
-            let mut new_secret = Vec::with_capacity(secret.len() + 1);
-            // build the new secret
-            new_secret.extend(secret.iter().chain(&mut [c].iter()));
-            // check this secret, and recursively check longer ones
-            if let Some(ans) = self.check_all(new_secret) {
-                return Some(ans);
+            let send_end = send.clone();
+            let msg = self.msg.clone();
+            let sig64 = self.sig64.clone();
+            let curr_secret_clone = curr_secret.clone();
+
+            thread_pool.execute(move || {
+                if is_secret_valid(&msg, &sig64, &curr_secret_clone) {
+                    send_end.send(curr_secret_clone).unwrap();  // found it!
+                }
+            });
+
+            if curr_secret.len() < self.max_len {
+                for &c in self.alphabet.iter() {
+                    // allocate space for a secret one character longer
+                    let mut new_secret = Vec::with_capacity(curr_secret.len() + 1);
+                    // build the new secret
+                    new_secret.extend(curr_secret.iter().chain(&mut [c].iter()));
+                    // check this secret, and recursively check longer ones
+                    queue.push_back(new_secret);
+                }
+            }
+            // try_recv() once per iteration to see if we have already found the secret
+            match receive.try_recv() {
+                Ok(answer) => {
+                    thread_pool.join();
+                    return answer
+                }
+                Err(_) => {}
             }
         }
-        None
+
+        // Block until we get the answer, we assume that we will not test with unsolvable test cases.
+        let answer = receive.recv().unwrap();
+        thread_pool.join();
+
+        answer
     }
 }
 
@@ -105,12 +135,7 @@ fn main() {
         msg,
         sig64,
     };
-    let ans = solver.check_all(b"".to_vec());
 
-    match ans {
-        Some(ans) => println!(
-            "{}", std::str::from_utf8(&ans).expect("answer not a valid string")
-        ),
-        None => println!("No answer found"),
-    };
+    let ans = solver.check_all(b"".to_vec());
+    println!("{}", std::str::from_utf8(&ans).expect("answer not a valid string"));
 }
